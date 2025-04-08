@@ -41,6 +41,7 @@ Accessibility::Accessibility(
     this->decays.push_back("exp");
     this->decays.push_back("linear");
     this->decays.push_back("flat");
+    this->decays.push_back("friction_curve");
 
     for (int i = 0 ; i < edgeweights.size() ; i++) {
         this->addGraphalg(new Graphalg(numnodes, edges, edgeweights[i],
@@ -440,7 +441,30 @@ Accessibility::aggregateAccessibilityVariable(
     if(decay == "flat")
         sum_function = [](const double &distance, const float &radius, const float &var)
                         { return var; };
+    if (decay == "friction_curve") {
+        // Gamma + offset
+        // f(d) = c + alpha * d^(k-1) * exp(- d / theta)
+        // best fit:
+        //   c=177.0997, alpha=28146.5031, k=2.4613, theta=1.77
+        double c      = 177.0997;
+        double alpha  = 28146.5031;
+        double k      = 2.4613;
+        double theta  = 1.77;
 
+        sum_function = [c, alpha, k, theta](const double &distance, const float &radius, const float &val)
+        {
+            // If distance <= 0, watch out for pow(d^(k-1))
+            // assume distances > 0. If some distance is 0, add a small epsilon.
+            double d_eff = std::max(distance, 1e-4);
+
+            double gamma_val = c + alpha * std::pow(d_eff, k - 1.0) * std::exp(-d_eff / theta);
+
+            // Multiply by val. This is your 'friction' times the variable from "vars"
+            return gamma_val * val;
+        };
+    }
+
+    // Sum across all nodes within radius
     for (int i = 0 ; i < distances.size() ; i++) {
         int nodeid = distances[i].first;
         double distance = distances[i].second;
