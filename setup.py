@@ -113,7 +113,7 @@ setup(
     url="https://udst.github.io/pandana/",
     ext_modules=[cyaccess],
     install_requires=[
-        'numpy >=1.8',
+        'numpy >=1.8,<2.0', # numpy 2.0 incompatible
         'pandas >=0.17',
         'requests >=2.0',
         'scikit-learn >=0.18',
