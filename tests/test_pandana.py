@@ -128,6 +128,158 @@ def test_agg_variables_accuracy(sample_osm):
     assert_allclose(s.mean(), r.std(), atol=1e-2)
 
 
+def test_cached_vs_uncached_aggregate_equality(sample_osm):
+    """Regression test for the reference-copy fix in
+    Accessibility::aggregateAccessibilityVariable: for any query radius at or
+    below the precomputed cache radius, the cached path and a from-scratch
+    (never-precomputed) network must return exactly the same aggregate result,
+    across every aggregation type and decay function. A cached-vs-uncached
+    divergence here would mean the cached branch is reading something other
+    than the true range-query result (e.g. a stale or partially-copied list).
+    """
+    cached = sample_osm  # module fixture; already net.precompute(2000)
+
+    nodes, edges = load_sample()
+    uncached = pdna.Network(nodes.x, nodes.y, edges["from"], edges.to, edges[["weight"]])
+    # deliberately never call uncached.precompute() -- every aggregate() call
+    # on this network takes the from-scratch graph-search branch
+
+    ssize = 50
+    connected_nodes = get_connected_nodes(cached)
+    node_ids = random_connected_nodes(cached, ssize)
+    values = random_data(ssize)
+
+    cached.set(node_ids, variable=values)
+    uncached.set(node_ids, variable=values)
+
+    # count/min/max/quantile aggregations never sum floats, so cached vs.
+    # uncached must match exactly. sum/mean/std do accumulate floats, and the
+    # cached and from-scratch searches can add the same values in a very
+    # slightly different order (different overall search depth: 2000 vs.
+    # 5/10/20) -- floating point addition isn't associative, so those are
+    # compared with a tolerance tight enough to catch a real bug (which would
+    # be many orders of magnitude larger than float rounding) while allowing
+    # genuine last-bit summation-order differences.
+    exact_types = {"count", "min", "max", "median", "25pct", "75pct"}
+
+    for agg_type in cached.aggregations:
+        for decay in cached.decays:
+            t = agg_type.decode(encoding="UTF-8")
+            d = decay.decode(encoding="UTF-8")
+            for distance in [5, 10, 20]:
+                s_cached = cached.aggregate(distance, type=t, decay=d).loc[connected_nodes]
+                s_uncached = uncached.aggregate(distance, type=t, decay=d).loc[connected_nodes]
+                err_msg = f"cached vs uncached mismatch for type={t} decay={d} distance={distance}"
+                if t in exact_types:
+                    np.testing.assert_array_equal(
+                        s_cached.values, s_uncached.values, err_msg=err_msg)
+                else:
+                    assert_allclose(
+                        s_cached.values, s_uncached.values,
+                        rtol=1e-9, atol=1e-9, err_msg=err_msg)
+
+
+def test_streaming_min_max_correctness():
+    """Regression test for the streaming min/max implementation added to
+    Accessibility::aggregateAccessibilityVariable (replacing the previous
+    sort-based quantileAccessibilityVariable path for these two types).
+    Ground truth is computed independently in Python via nodes_in_range() --
+    a different code path from aggregate() -- rather than reusing any of
+    pandana's own aggregation logic. Uses a dedicated network rather than the
+    shared sample_osm fixture, so this test's own precompute() call can't
+    interact with the precompute() calls other tests make against that
+    shared, module-scoped fixture (see test_nodes_in_range, which changes
+    sample_osm's precompute radius to 10).
+    """
+    nodes, edges = load_sample()
+    net = pdna.Network(nodes.x, nodes.y, edges["from"], edges.to, edges[["weight"]])
+    net.precompute(2000)
+
+    np.random.seed(1)
+    ssize = 50
+    connected_nodes = get_connected_nodes(net)
+    node_ids = random_connected_nodes(net, ssize)
+    values = random_data(ssize)
+    net.set(node_ids, variable=values)
+
+    # accessibility_vars_t stores float (float32), not the float64 that
+    # FLOAT_DTYPE sends in from Python -- round the reference values through
+    # float32 too, or an exact-equality check would fail on unrelated
+    # precision narrowing rather than an actual bug.
+    pairs = pd.DataFrame({
+        "node_id": node_ids.values,
+        "value": values.values.astype(np.float32),
+    })
+
+    sources = connected_nodes[:10]
+
+    for radius in [500, 2000]:
+        agg_max = net.aggregate(radius, type="max")
+        agg_min = net.aggregate(radius, type="min")
+
+        ranges = net.nodes_in_range(sources, radius)
+
+        for src in sources:
+            reachable = ranges.loc[ranges["source"] == src, "destination"]
+            matched = pairs[pairs["node_id"].isin(reachable.values)]
+            if len(matched) == 0:
+                assert agg_max.loc[src] == -1
+                assert agg_min.loc[src] == -1
+            else:
+                assert agg_max.loc[src] == matched["value"].max()
+                assert agg_min.loc[src] == matched["value"].min()
+
+
+def test_double_precompute_cache_not_corrupted():
+    """Regression test for the Graphalg::Range clear() fix: calling
+    Network.precompute() a second time (here, at a different radius than the
+    first call) must fully replace the cached range-query results, not
+    append to them. Before the fix, dms[j][i] already held entries from the
+    first precompute() call (vector::resize() to an unchanged size is a
+    no-op, so the second call's fresh, internally-sorted batch was appended
+    after the stale entries from the first), corrupting both the
+    aggregation results and the sorted-by-distance invariant the continue/
+    break early-exit relies on.
+    """
+    nodes, edges = load_sample()
+
+    net = pdna.Network(nodes.x, nodes.y, edges["from"], edges.to, edges[["weight"]])
+    net.precompute(1000)  # first precompute, deliberately a different radius
+    net.precompute(2000)  # second precompute, same network object
+
+    reference = pdna.Network(nodes.x, nodes.y, edges["from"], edges.to, edges[["weight"]])
+    # never precomputed -- always takes the from-scratch graph-search branch
+
+    np.random.seed(2)
+    ssize = 50
+    connected_nodes = get_connected_nodes(net)
+    node_ids = random_connected_nodes(net, ssize)
+    values = random_data(ssize)
+
+    net.set(node_ids, variable=values)
+    reference.set(node_ids, variable=values)
+
+    exact_types = {"count", "min", "max", "median", "25pct", "75pct"}
+
+    for agg_type in net.aggregations:
+        for decay in net.decays:
+            t = agg_type.decode(encoding="UTF-8")
+            d = decay.decode(encoding="UTF-8")
+            for distance in [5, 10, 20]:
+                s_twice = net.aggregate(distance, type=t, decay=d).loc[connected_nodes]
+                s_ref = reference.aggregate(distance, type=t, decay=d).loc[connected_nodes]
+                err_msg = (
+                    f"double-precompute mismatch for type={t} decay={d} distance={distance}"
+                )
+                if t in exact_types:
+                    np.testing.assert_array_equal(
+                        s_twice.values, s_ref.values, err_msg=err_msg)
+                else:
+                    assert_allclose(
+                        s_twice.values, s_ref.values,
+                        rtol=1e-9, atol=1e-9, err_msg=err_msg)
+
+
 def test_non_integer_nodeids():
 
     nodes, edges = load_sample()

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <unordered_map>
 #include <utility>
 #include "graphalg.h"
@@ -341,7 +342,7 @@ Accessibility::getAllAggregateAccessibilityVariables(
 
 double
 Accessibility::quantileAccessibilityVariable(
-    DistanceVec &distances,
+    const DistanceVec &distances,
     accessibility_vars_t &vars,
     float quantile,
     float radius) {
@@ -349,11 +350,16 @@ Accessibility::quantileAccessibilityVariable(
     // first iterate through nodes in order to get count of items
     int cnt = 0;
 
+    // distances is sorted ascending (a guaranteed property of the underlying
+    // Dijkstra-style range search, see Graphalg::Range), so once one entry
+    // exceeds radius every remaining entry does too -- break rather than
+    // continuing to check (and skip) the rest of a potentially much larger
+    // cached list.
     for (int i = 0 ; i < distances.size() ; i++) {
         int nodeid = distances[i].first;
         double distance = distances[i].second;
 
-        if (distance > radius) continue;
+        if (distance > radius) break;
 
         cnt += vars[nodeid].size();
     }
@@ -367,7 +373,7 @@ Accessibility::quantileAccessibilityVariable(
         int nodeid = distances[i].first;
         double distance = distances[i].second;
 
-        if (distance > radius) continue;
+        if (distance > radius) break;
 
         // and then iterate through all items at the node
         for (int j = 0 ; j < vars[nodeid].size() ; j++)
@@ -393,26 +399,54 @@ Accessibility::aggregateAccessibilityVariable(
     string aggtyp,
     string decay,
     int gno) {
-    // I don't know if this is the best way to do this but I
-    // I don't want to copy memory in the precompute case - sometimes
-    // I need a reference and sometimes not
+    // Bind to the cached range-query result via pointer instead of copying
+    // it. A C++ reference can't be re-pointed after initialization, so the
+    // previous "DistanceVec &distances = tmp; distances = dms[...];" pattern
+    // was actually a full vector copy through the reference on every call,
+    // despite the original intent (avoiding a copy in the precompute case).
     DistanceVec tmp;
-    DistanceVec &distances = tmp;
+    const DistanceVec *distances_ptr;
     if (dmsradius > 0 && radius <= dmsradius) {
-        distances = dms[gno][srcnode];
+        distances_ptr = &dms[gno][srcnode];
     } else {
         ga[gno]->Range(
             srcnode,
             radius,
             omp_get_thread_num(),
             tmp);
+        distances_ptr = &tmp;
     }
+    const DistanceVec &distances = *distances_ptr;
 
     if (distances.size() == 0) return -1;
 
-    if (aggtyp == "min") {
-        return this->quantileAccessibilityVariable(
-            distances, vars, 0.0, radius);
+    if (aggtyp == "max" || aggtyp == "min") {
+        // Streaming extremum instead of quantileAccessibilityVariable's
+        // sort-based path below: min/max only need a single running-best
+        // pass (O(k), no extra allocation), not a full sort (O(k log k)) of
+        // every candidate value just to read off the first or last entry.
+        // Compared as float, matching accessibility_vars_t's actual storage
+        // type (vector<vector<float>>), so this returns the same value the
+        // old sort-based path would have.
+        bool is_max = (aggtyp == "max");
+        float best = is_max ? -std::numeric_limits<float>::infinity()
+                             :  std::numeric_limits<float>::infinity();
+        bool found = false;
+        // distances is sorted ascending (see Graphalg::Range), so this can
+        // stop at the first out-of-radius entry instead of scanning the rest.
+        for (int i = 0 ; i < distances.size() ; i++) {
+            int nodeid = distances[i].first;
+            double distance = distances[i].second;
+
+            if (distance > radius) break;
+
+            for (int j = 0 ; j < vars[nodeid].size() ; j++) {
+                found = true;
+                float v = vars[nodeid][j];
+                if (is_max ? (v > best) : (v < best)) best = v;
+            }
+        }
+        return found ? best : -1;
     } else if (aggtyp == "25pct") {
         return this->quantileAccessibilityVariable(
             distances, vars, 0.25, radius);
@@ -422,9 +456,6 @@ Accessibility::aggregateAccessibilityVariable(
     } else if (aggtyp == "75pct") {
         return this->quantileAccessibilityVariable(
             distances, vars, 0.75, radius);
-    } else if (aggtyp == "max") {
-        return this->quantileAccessibilityVariable(
-            distances, vars, 1.0, radius);
     }
 
     if (aggtyp == "std") decay = "flat";
@@ -467,13 +498,15 @@ Accessibility::aggregateAccessibilityVariable(
         };
     }
 
-    // Sum across all nodes within radius
+    // Sum across all nodes within radius. distances is sorted ascending
+    // (see Graphalg::Range), so once one entry exceeds radius every
+    // remaining entry does too -- stop here rather than walking the rest of
+    // a cached list that may be sized for a much larger radius.
     for (int i = 0 ; i < distances.size() ; i++) {
         int nodeid = distances[i].first;
         double distance = distances[i].second;
 
-        // this can now happen since we're precomputing
-        if (distance > radius) continue;
+        if (distance > radius) break;
 
         for (int j = 0 ; j < vars[nodeid].size() ; j++) {
             cnt++;  // count items

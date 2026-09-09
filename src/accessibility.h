@@ -122,7 +122,7 @@ class Accessibility {
 
     double
     quantileAccessibilityVariable(
-        DistanceVec &distances,
+        const DistanceVec &distances,
         accessibility_vars_t &vars,
         float quantile,
         float radius);

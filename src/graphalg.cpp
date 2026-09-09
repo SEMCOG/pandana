@@ -76,6 +76,14 @@ double Graphalg::Distance(int src, int tgt, int threadNum) {
 
 void Graphalg::Range(int src, double maxdist, int threadNum,
                      DistanceVec &ResultingNodes) {
+    // Callers (notably Accessibility::precomputeRangeQueries, which passes
+    // dms[j][i] directly as ResultingNodes) may reuse an already-populated
+    // vector -- e.g. a second Network.precompute() call on the same network.
+    // Without clearing first, this would append a fresh, internally-sorted
+    // batch after old entries rather than replacing them, leaving the
+    // combined vector non-sorted overall and holding stale/duplicated data.
+    ResultingNodes.clear();
+
     CH::Node src_node(src, 0, 0);
 
     std::vector<std::pair<NodeID, unsigned> > tmp;
